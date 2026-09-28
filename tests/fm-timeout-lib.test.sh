@@ -109,7 +109,8 @@ test_the_bound_replaces_the_calling_shell() {
     rm -f "$dir/caller" "$dir/parent"
     (
       . "$ROOT/bin/fm-timeout-lib.sh"
-      printf '%s\n' "$BASHPID" > "$dir/caller"
+      # Bash 3.2 has no BASHPID; an exec'd child shell's PPID names this frame.
+      printf '%s\n' "${BASHPID:-$(exec sh -c 'printf "%s\n" "$PPID"')}" > "$dir/caller"
       PATH=$path fm_exec_timed 5 1 bash -c 'echo "$PPID" > "$1"' _ "$dir/parent"
     ) || fail "the bounded probe failed under PATH=$path"
     caller=$(cat "$dir/caller")
@@ -211,10 +212,10 @@ test_an_owner_that_dies_during_startup_ends_the_command() {
   PATH=$PERL_ONLY bash -c '
     . "$1/bin/fm-timeout-lib.sh"
     (
-      echo "$BASHPID" > "$2/watchdog"
       while kill -0 "$$" 2>/dev/null; do sleep 0.05; done
       fm_exec_timed 60 1 bash -c "exec sleep 300"
     ) >/dev/null 2>&1 &
+    echo "$!" > "$2/watchdog"
     exit 0
   ' _ "$ROOT" "$dir"
   wait_for_file "$dir/watchdog"
@@ -235,9 +236,11 @@ test_an_owner_that_dies_during_startup_ends_the_command() {
 # by unsetting it in-shell, which the shell does not repopulate the way it does
 # after env -u. The start script lets the bounded command's owner die before
 # the watchdog starts, so only the owner the library resolved can end the
-# command, which ignores TERM so it records its pid before the KILL reaches it.
+# command before its bound. The escalation can reach the command before it
+# records its pid, so a recorded pid is checked only when there is one; the
+# library's own failure shows on stderr instead.
 owner_death_without_bashpid() {  # <case>
-  local dir=$TMP_ROOT/no-bashpid-$1 watchdog started pid
+  local dir=$TMP_ROOT/no-bashpid-$1 watchdog started
   # shellcheck disable=SC2016 # the bounded shell expands its own argument
   PATH=$PERL_ONLY bash -c 'unset BASHPID; . "$1/start"' _ "$dir"
   wait_for_file "$dir/watchdog"
@@ -252,12 +255,12 @@ owner_death_without_bashpid() {  # <case>
     sleep 0.02
   done
   [ ! -s "$dir/errors" ] || fail "without BASHPID ($1) fm_exec_timed failed: $(cat "$dir/errors")"
-  [ -s "$dir/command" ] || fail "without BASHPID ($1) the bounded command never started"
-  pid=$(cat "$dir/command")
-  ! kill -0 "$pid" 2>/dev/null || fail "without BASHPID ($1) the bounded command outlived its owner"
+  [ ! -s "$dir/command" ] || ! kill -0 "$(cat "$dir/command")" 2>/dev/null \
+    || fail "without BASHPID ($1) the bounded command outlived its owner"
 }
 
-# write_bounded_command <dir>: the TERM-ignoring command both cases bound.
+# write_bounded_command <dir>: the command both cases bound, which ignores TERM
+# once it is running so only the grace's KILL can end it.
 write_bounded_command() {  # <dir>
   mkdir -p "$1"
   # shellcheck disable=SC2016 # the bounded command expands its own pid
