@@ -18,7 +18,7 @@ TMP_ROOT=$(fm_test_tmproot fm-timeout-lib)
 # timeout variant: fm_exec_timed must take its perl watchdog here.
 PERL_ONLY="$TMP_ROOT/perl-only-bin"
 mkdir -p "$PERL_ONLY"
-for tool in perl bash sleep; do
+for tool in perl bash sh sleep; do
   ln -s "$(command -v "$tool")" "$PERL_ONLY/$tool"
 done
 
@@ -230,6 +230,76 @@ test_an_owner_that_dies_during_startup_ends_the_command() {
   pass "fm_exec_timed ends the command when its owner dies during watchdog startup"
 }
 
+# owner_death_without_bashpid <case>: run <dir>/start under a bash with no
+# BASHPID - stock macOS Bash 3.2 has none, and a newer bash is made to lack it
+# by unsetting it in-shell, which the shell does not repopulate the way it does
+# after env -u. The start script lets the bounded command's owner die before
+# the watchdog starts, so only the owner the library resolved can end the
+# command, which ignores TERM so it records its pid before the KILL reaches it.
+owner_death_without_bashpid() {  # <case>
+  local dir=$TMP_ROOT/no-bashpid-$1 watchdog started pid
+  # shellcheck disable=SC2016 # the bounded shell expands its own argument
+  PATH=$PERL_ONLY bash -c 'unset BASHPID; . "$1/start"' _ "$dir"
+  wait_for_file "$dir/watchdog"
+  watchdog=$(cat "$dir/watchdog")
+  started=$SECONDS
+  while kill -0 "$watchdog" 2>/dev/null; do
+    if [ "$((SECONDS - started))" -ge 15 ]; then
+      kill -KILL "$watchdog" 2>/dev/null || true
+      [ ! -s "$dir/command" ] || kill -KILL "$(cat "$dir/command")" 2>/dev/null || true
+      fail "without BASHPID ($1) a watchdog whose owner died during startup ran on toward its bound"
+    fi
+    sleep 0.02
+  done
+  [ ! -s "$dir/errors" ] || fail "without BASHPID ($1) fm_exec_timed failed: $(cat "$dir/errors")"
+  [ -s "$dir/command" ] || fail "without BASHPID ($1) the bounded command never started"
+  pid=$(cat "$dir/command")
+  ! kill -0 "$pid" 2>/dev/null || fail "without BASHPID ($1) the bounded command outlived its owner"
+}
+
+# write_bounded_command <dir>: the TERM-ignoring command both cases bound.
+write_bounded_command() {  # <dir>
+  mkdir -p "$1"
+  # shellcheck disable=SC2016 # the bounded command expands its own pid
+  printf '%s\n' 'trap "" TERM' 'echo "$$" > "$1"' 'exec sleep 300' > "$1/command.sh"
+}
+
+# A subshell caller's owner is the calling script ($$), which only the
+# subshell's own pid tells apart from the frame about to become the watchdog.
+test_a_subshell_owner_is_watched_without_bashpid() {
+  local dir=$TMP_ROOT/no-bashpid-subshell
+  write_bounded_command "$dir"
+  cat > "$dir/start" <<FIXTURE
+. "$ROOT/bin/fm-timeout-lib.sh"
+(
+  while kill -0 "\$\$" 2>/dev/null; do sleep 0.05; done
+  fm_exec_timed 60 1 bash "$dir/command.sh" "$dir/command"
+) >/dev/null 2>"$dir/errors" &
+echo "\$!" > "$dir/watchdog"
+FIXTURE
+  owner_death_without_bashpid subshell
+  pass "fm_exec_timed watches a subshell caller's script as owner without BASHPID"
+}
+
+# A caller running fm_exec_timed in its own main shell is the frame the
+# watchdog replaces, so its owner is its parent.
+test_a_main_shell_owner_is_watched_without_bashpid() {
+  local dir=$TMP_ROOT/no-bashpid-main-shell
+  write_bounded_command "$dir"
+  cat > "$dir/caller" <<FIXTURE
+unset BASHPID
+. "$ROOT/bin/fm-timeout-lib.sh"
+while kill -0 "\$PPID" 2>/dev/null; do sleep 0.05; done
+fm_exec_timed 60 1 bash "$dir/command.sh" "$dir/command"
+FIXTURE
+  cat > "$dir/start" <<FIXTURE
+bash "$dir/caller" >/dev/null 2>"$dir/errors" &
+echo "\$!" > "$dir/watchdog"
+FIXTURE
+  owner_death_without_bashpid main-shell
+  pass "fm_exec_timed watches a main-shell caller's parent as owner without BASHPID"
+}
+
 # perl is preferred whenever it exists, because only its watchdog can reap a
 # leftover descendant after replacing the caller.
 test_perl_is_preferred_over_timeout() {
@@ -337,6 +407,8 @@ test_a_descendant_holding_the_output_cannot_outlast_the_bound
 test_a_signal_to_the_bounding_process_reaches_the_command
 test_a_named_owner_that_is_gone_ends_the_command
 test_an_owner_that_dies_during_startup_ends_the_command
+test_a_subshell_owner_is_watched_without_bashpid
+test_a_main_shell_owner_is_watched_without_bashpid
 test_perl_is_preferred_over_timeout
 test_refuses_rather_than_running_unbounded
 test_rejects_malformed_bounds_before_running_anything
