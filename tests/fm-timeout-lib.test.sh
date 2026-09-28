@@ -22,6 +22,14 @@ for tool in perl bash sh sleep; do
   ln -s "$(command -v "$tool")" "$PERL_ONLY/$tool"
 done
 
+# A PATH with perl but neither sh nor a BASHPID-capable caller: the frame pid
+# resolution has nothing left to fall back on and must refuse.
+NO_SH="$TMP_ROOT/no-sh-bin"
+mkdir -p "$NO_SH"
+for tool in perl bash touch; do
+  ln -s "$(command -v "$tool")" "$NO_SH/$tool"
+done
+
 # exec_timed <path> <seconds> <grace> <command...>: source the library under
 # the ordinary PATH, then run the bounded call under <path> as the last command
 # of a subshell, exactly as a real caller does.
@@ -285,22 +293,48 @@ FIXTURE
 }
 
 # A caller running fm_exec_timed in its own main shell is the frame the
-# watchdog replaces, so its owner is its parent.
+# watchdog replaces, so its owner is its parent. $PPID is fixed at shell
+# startup, so the caller must capture it and signal the capture before start
+# exits: otherwise start can exit, and the caller can be reparented, before it
+# ever reads $PPID, and it would then spin-wait on a live process forever.
 test_a_main_shell_owner_is_watched_without_bashpid() {
   local dir=$TMP_ROOT/no-bashpid-main-shell
   write_bounded_command "$dir"
   cat > "$dir/caller" <<FIXTURE
 unset BASHPID
 . "$ROOT/bin/fm-timeout-lib.sh"
-while kill -0 "\$PPID" 2>/dev/null; do sleep 0.05; done
+original_parent=\$PPID
+: > "$dir/captured"
+while kill -0 "\$original_parent" 2>/dev/null; do sleep 0.05; done
 fm_exec_timed 60 1 bash "$dir/command.sh" "$dir/command"
 FIXTURE
   cat > "$dir/start" <<FIXTURE
 bash "$dir/caller" >/dev/null 2>"$dir/errors" &
 echo "\$!" > "$dir/watchdog"
+while [ ! -e "$dir/captured" ]; do sleep 0.02; done
 FIXTURE
   owner_death_without_bashpid main-shell
   pass "fm_exec_timed watches a main-shell caller's parent as owner without BASHPID"
+}
+
+# Without BASHPID and without sh, fm_exec_timed has no way left to name its own
+# frame pid, so it must refuse instead of silently keeping $$ as the owner -
+# which would watch the wrong process and could never detect that owner's
+# death.
+test_refuses_when_it_cannot_resolve_its_frame_pid_without_bashpid() {
+  local dir out rc=0
+  dir="$TMP_ROOT/no-frame-pid"
+  mkdir -p "$dir"
+  out=$(PATH=$NO_SH bash -c '
+    unset BASHPID
+    . "$1/bin/fm-timeout-lib.sh"
+    fm_exec_timed 5 1 touch "$2/ran"
+  ' _ "$ROOT" "$dir" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "fm_exec_timed ran without resolving its frame pid (rc=$rc)"
+  [ ! -e "$dir/ran" ] || fail "fm_exec_timed ran the command despite failing to resolve its frame pid"
+  assert_contains "$out" "could not determine the calling shell pid" \
+    "fm_exec_timed's refusal did not name why it failed"
+  pass "fm_exec_timed refuses when BASHPID is unset and it cannot resolve its frame pid"
 }
 
 # perl is preferred whenever it exists, because only its watchdog can reap a
@@ -309,7 +343,7 @@ test_perl_is_preferred_over_timeout() {
   local dir out
   dir="$TMP_ROOT/prefer"
   mkdir -p "$dir/bin"
-  for tool in perl bash; do
+  for tool in perl bash sh; do
     ln -s "$(command -v "$tool")" "$dir/bin/$tool"
   done
   printf '#!/bin/sh\necho timeout-used > "%s"\nexit 99\n' "$dir/timeout-used" > "$dir/bin/timeout"
@@ -324,7 +358,9 @@ test_refuses_rather_than_running_unbounded() {
   local dir out rc=0
   dir="$TMP_ROOT/unboundable"
   mkdir -p "$dir/bin"
-  ln -s "$(command -v bash)" "$dir/bin/bash"
+  for tool in bash sh; do
+    ln -s "$(command -v "$tool")" "$dir/bin/$tool"
+  done
   out=$(exec_timed "$dir/bin" 5 1 bash -c ': > "$1"' _ "$dir/ran" 2>&1) || rc=$?
   [ "$rc" -eq 127 ] || fail "fm_exec_timed ran with nothing to bound it (rc=$rc)"
   assert_contains "$out" "cannot bound bash within 5s" "the refusal did not say what it could not bound"
@@ -360,7 +396,7 @@ test_gnu_timeout_kills_a_term_ignoring_command_after_the_grace() {
   fb="$dir/bin"
   mkdir -p "$fb"
   # No perl here, so the call falls back to GNU timeout.
-  for tool in timeout bash sleep; do
+  for tool in timeout bash sleep sh; do
     ln -s "$(command -v "$tool")" "$fb/$tool"
   done
   started=$SECONDS
@@ -412,6 +448,7 @@ test_a_named_owner_that_is_gone_ends_the_command
 test_an_owner_that_dies_during_startup_ends_the_command
 test_a_subshell_owner_is_watched_without_bashpid
 test_a_main_shell_owner_is_watched_without_bashpid
+test_refuses_when_it_cannot_resolve_its_frame_pid_without_bashpid
 test_perl_is_preferred_over_timeout
 test_refuses_rather_than_running_unbounded
 test_rejects_malformed_bounds_before_running_anything

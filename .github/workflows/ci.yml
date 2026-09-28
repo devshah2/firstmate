@@ -498,8 +498,8 @@ jobs:
           timeout_output=$(/bin/bash tests/fm-timeout-lib.test.sh)
           printf '%s\n' "$timeout_output"
           timeout_count=$(printf '%s\n' "$timeout_output" | grep -c '^ok - ')
-          [ "$timeout_count" -eq 17 ] || {
-            echo "::error::expected 17 timeout-lib bash 3.2 tests, got $timeout_count"
+          [ "$timeout_count" -eq 18 ] || {
+            echo "::error::expected 18 timeout-lib bash 3.2 tests, got $timeout_count"
             exit 1
           }
           for case in "a subshell caller's script" "a main-shell caller's parent"; do
