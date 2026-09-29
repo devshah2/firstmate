@@ -1484,8 +1484,8 @@ wedge_dead_record() {  # <window> <since-file> <triage-label> <idle-age> <pane-h
 # can be absorbed this way: the plain non-terminal path, and the
 # stale_is_terminal-overridden path (a captain-relevant status-log line that an
 # active run/busy pane outranked).
-# The wait-evidence consult (wedge_wait_evidence), the worktree write probe, and
-# the dead-record probe (wedge_dead_record) run ONLY here, inside the
+# The dead-record probe (wedge_dead_record), wait-evidence consult
+# (wedge_wait_evidence), and worktree write probe run ONLY here, inside the
 # at-threshold branch that is about to escalate: at most one each per window per
 # STALE_ESCALATE_SECS, never on an ordinary poll. The crew-state read
 # wedge_wait_evidence may take under config/wedge-defer-parked-gate keeps that
@@ -1511,8 +1511,13 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
       fm_epoch_seconds_to age
       age=$(( age - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+        # A captain hold suppresses repeat wedge alarms, not proof that the
+        # endpoint is gone. Check death first so a held task can never conceal
+        # a failed agent.
+        if wedge_dead_record "$win" "$since_file" "$label" "$age" "$hash" "$task"; then
+          return 0
+        fi
         if captain_call_stale_bound "$(window_key "$win")" "$task"; then
-          clear_pause_tracking "$(window_key "$win")"
           triage_log "absorbed $label (open captain hold): $win"
           return 0
         fi
@@ -1522,9 +1527,6 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         fi
         if crew_worktree_written_since "$task" "$STATE" "$since_file"; then
           wedge_defer_writing "$win" "$since_file" "$label" "$age"
-          return 0
-        fi
-        if wedge_dead_record "$win" "$since_file" "$label" "$age" "$hash" "$task"; then
           return 0
         fi
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
@@ -1892,10 +1894,11 @@ surface_nonterminal_stale() {  # <window> <hash>
       stale_wait_throttled "$key" "$STALE_WAIT_DECLARATION" && throttled=0
     fi
   elif captain_call_stale_bound "$key" "$task"; then
-    bounded=0
-    throttled=0
-  elif [ -n "$STALE_WAIT_DECLARATION" ]; then
-    bounded=0
+    # Leave the hash unseen while the hold is open. That preserves the ordinary
+    # stale path for the very next poll after release, even if the pane did not
+    # change, and does not delete an already-overdue wedge timer.
+    triage_log "absorbed non-terminal stale (open captain hold): $win"
+    return 0
   fi
   if [ "$throttled" -ne 0 ]; then
     fm_wake_append stale "$win" "stale: $win" || exit 1
@@ -3036,9 +3039,6 @@ EOF
               # re-surface - the captain already has everything a repeat alarm
               # would say. Releasing the hold falls through to ordinary
               # supervision on the very next check.
-              printf '%s' "$h" > "$sf"
-              rm -f "$ssf"
-              clear_write_tracking "$key"
               triage_log "absorbed stale (open captain call already surfaced for this status): $w"
             else
               fm_wake_append stale "$w" "stale: $w" || exit 1

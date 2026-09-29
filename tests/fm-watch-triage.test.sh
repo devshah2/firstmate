@@ -4076,7 +4076,8 @@ test_open_captain_call_suppresses_stale_until_released() {
     printf 'go ahead\n' > "$dir/decision.txt"
     run_hold "$dir" answer held-merge --decision-file "$dir/decision.txt" --release \
       || { reap "$pid"; fail "[$name] could not release the captain hold"; }
-    printf 'idle, released\n' > "$capture"
+    # Keep the exact same pane hash. Release must restore supervision without
+    # relying on display churn to make the stale task visible again.
     wait_for_exit "$pid" 100 || { reap "$pid"; fail "[$name] releasing the hold did not restore stale escalation"; }
     wakes=$(hold_stale_wakes "$state")
     [ "$wakes" -eq 1 ] \
@@ -4104,9 +4105,10 @@ test_open_captain_call_suppresses_wedges_until_released() {
   pid=$!
   wait_poll_cycle "$state" "$pid" || { reap "$pid"; fail "watcher exited before wedge tracking began"; }
   wait_poll_cycle "$state" "$pid" || { reap "$pid"; fail "watcher exited while starting wedge tracking"; }
+  printf '%s\n' "$(( $(date +%s) - 60 ))" > "$state/.stale-since-$(hold_key)"
   wait_poll_cycle "$state" "$pid" || { reap "$pid"; fail "watcher exited before testing a held wedge"; }
-  sleep 2
-  wait_poll_cycle "$state" "$pid" || { reap "$pid"; fail "a held task wedge-escalated"; }
+  [ -e "$state/.stale-since-$(hold_key)" ] \
+    || { reap "$pid"; fail "a held task discarded its overdue wedge timer"; }
   [ ! -e "$state/.wedge-escalations-$(hold_key)" ] \
     || { reap "$pid"; fail "a held task recorded a wedge escalation"; }
 
@@ -4117,6 +4119,34 @@ test_open_captain_call_suppresses_wedges_until_released() {
   grep -F 'possible wedge, escalation 1' "$out" >/dev/null \
     || fail "released work did not report a wedge: $(cat "$out")"
   pass "an open captain hold suppresses wedges, and release restores the same watcher's wedge ladder"
+}
+
+test_open_captain_hold_never_hides_a_dead_agent() {
+  local dir state out capture pid wakes
+  command -v tasks-axi >/dev/null 2>&1 \
+    || { echo "skip: tasks-axi not found (captain-hold dead endpoint)"; return 0; }
+  dir=$(make_hold_home held-dead-agent 'working: validation continues' hold) \
+    || fail "could not build a held dead-agent fixture"
+  state="$dir/state"; out="$dir/watch.out"; capture="$dir/pane.txt"
+  printf 'idle, agent disappeared\n' > "$capture"
+  PATH="$dir/fakebin:$PATH" FM_FAKE_TMUX_WINDOW=test:fm-held-merge \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validation running' \
+    FM_WATCH_HANDLING_SUCCESSOR=1 FM_HOME="$dir" FM_DATA_OVERRIDE="$dir/data" \
+    FM_CONFIG_OVERRIDE="$dir/config" FM_STATE_OVERRIDE="$state" \
+    FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=1 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" 2>&1 &
+  pid=$!
+  wait_poll_cycle "$state" "$pid" || { reap "$pid"; fail "watcher exited before dead-agent tracking began"; }
+  printf '%s\n' "$(( $(date +%s) - 60 ))" > "$state/.stale-since-$(hold_key)"
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a captain hold hid a dead endpoint"; }
+  wakes=$(hold_stale_wakes "$state")
+  [ "$wakes" -eq 1 ] \
+    || fail "a held dead endpoint queued $wakes wakes instead of one"
+  grep -F 'agent dead' "$out" >/dev/null \
+    || fail "the held dead endpoint report did not name the failure: $(cat "$out")"
+  pass "an open captain hold never suppresses a dead-agent report"
 }
 
 
@@ -6704,6 +6734,7 @@ test_wedge_threshold_parked_gate_is_off_until_armed
 test_wedge_defer_refuses_a_half_filled_wait_record
 test_open_captain_call_suppresses_stale_until_released
 test_open_captain_call_suppresses_wedges_until_released
+test_open_captain_hold_never_hides_a_dead_agent
 test_stale_churn_without_a_captain_call_still_alarms
 test_failed_wake_append_keeps_an_unheld_task_actionable
 test_secondmate_paused_resurfaces_in_normal_mode
