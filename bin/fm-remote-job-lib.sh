@@ -834,7 +834,11 @@ fm_remote_job_plist_safe_path() {
 }
 
 fm_remote_job_render_launchagent() { # <remote-root> <account-home>
-  local root=$1 account_home=$2 worker
+  local root=$1 account_home=$2 worker account
+  # launchd gives agents no USER/LOGNAME; workers launched from here need them
+  # for macOS keychain logins (Claude keys its stored login to the account).
+  account=$(id -un 2>/dev/null) || return 1
+  fm_remote_job_plist_safe_path "$account" || return 1
   worker="$root/bin/fm-remote-job-worker.sh"
   fm_remote_job_launchagent_paths "$account_home"
   fm_remote_job_plist_safe_path "$worker" && fm_remote_job_plist_safe_path "$account_home" &&
@@ -856,6 +860,10 @@ fm_remote_job_render_launchagent() { # <remote-root> <account-home>
 		<string>$account_home</string>
 		<key>FM_ROOT_OVERRIDE</key>
 		<string>$root</string>
+		<key>USER</key>
+		<string>$account</string>
+		<key>LOGNAME</key>
+		<string>$account</string>
 	</dict>
 	<key>LimitLoadToSessionType</key>
 	<string>Aqua</string>

@@ -175,6 +175,16 @@ fm_worker_account_check() {
   for name in TMPDIR USER LOGNAME; do
     [ -z "${!name:-}" ] || clean+=("$name=${!name}")
   done
+  # A launchd agent (the remote job worker) can run without USER/LOGNAME, and
+  # macOS keys the Claude keychain login to the account name, so a missing
+  # USER reads a signed-in root as signed out. Fill both from the real uid.
+  if [ -z "${USER:-}" ] || [ -z "${LOGNAME:-}" ]; then
+    name=$(id -un 2>/dev/null) || name=
+    if [ -n "$name" ]; then
+      [ -n "${USER:-}" ] || clean+=("USER=$name")
+      [ -n "${LOGNAME:-}" ] || clean+=("LOGNAME=$name")
+    fi
+  fi
   case "$harness" in
   claude)
     [ -z "$root" ] || clean+=("CLAUDE_CONFIG_DIR=$root")
